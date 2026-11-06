@@ -1,0 +1,354 @@
+#!/usr/bin/env bash
+
+DATA="$(cd "$(dirname "$0")" && pwd)/data"
+
+DL="$DATA/pages"        # on depose ici les pages : ville-codepostal.html
+DB="$DATA/analyses"
+DC="$DATA/cache"
+
+mkdirs() { mkdir -p "$DL" 
+	 touch "$DB";}
+usage() {
+    echo "meteo option*"
+    echo "  -i             initialisation"
+    echo "  -c             efface les pages"
+    echo "  -e             efface les analyses"
+    echo "  -m ville       verifie la page meteo deposee"
+    echo "  -a             analyse les pages HTML"
+    echo "  -l             affiche le tableau des analyses"
+    echo "  -w ville jour  cree une page HTML"
+    echo "  -h             affiche cette aide"
+}
+
+
+do_init()  { rm -rf "$DATA"; mkdirs; }
+do_clean() { mkdirs; rm -f "$DL"/*; }
+do_erase() { mkdirs; : > "$DB"; }
+
+do_meteo() {
+    local ville="$1"
+    local source_file
+    local destination
+
+    if [ -z "$ville" ]; then
+        echo "Erreur : indiquez une ville."
+        return 1
+    fi
+
+    mkdirs
+
+    local SOURCES="$(dirname "$DATA")/sources"
+
+    source_file="$SOURCES/$ville.html"
+    destination="$DL/$ville.html"
+
+    if [ ! -f "$source_file" ]; then
+        echo "Erreur : fichier introuvable : $source_file"
+        return 1
+    fi
+
+    cp "$source_file" "$destination"
+
+    echo "Page meteo copiee : $destination"
+}
+
+mkdirs
+
+save_day(){
+	[ "$day" -lt 0 ] && return
+	[ "$day" -gt 7 ] && return
+
+	local vent="NA"
+
+	[ "$n" -gt 0 ] && vent=$(awk "BEGIN { printf \"%.1f\", $sum / $n }")
+
+        local date_jour
+
+        date_jour=$(date -d "$capture + $day days" +%Y-%m-%d)
+        echo "$capture|$ville|$postal|$date_jour|$ciel|$tmin|$tmax|$vent|6" >> "$DB"
+}
+	
+do_analyse() {
+    mkdirs
+    
+    local file name capture ville postal
+    local line day ciel tmin tmax
+    local sum n nciel attente temp vent_value
+    local tmp
+    
+    capture=$(date +%Y-%m-%d)
+    for file in "$DL"/*.html; do
+        [ -f "$file" ] || continue
+
+        name=$(basename "$file" .html)
+        postal=${name##*-}
+        ville=${name%-*}
+
+        tmp=$(mktemp)
+
+        sed 's/</\n</g; s/>/>\n/g' "$file" |
+            tr -d '\r\t' |
+            sed 's/^ *//; s/ *$//' |
+            grep -v '^$' > "$tmp"
+
+            day=-1
+            attente=""
+        
+        while IFS= read -r line; do
+
+            case "$line" in
+
+                '<h4'*day_text*)
+        
+                    save_day
+
+                    day=$((day + 1))
+
+                    ciel=""
+                    tmin=""
+                    tmax=""
+                    sum=0
+                    n=0
+                    nciel=0
+                    attente=""
+                    ;;
+
+                '<img'*shape-weather*)
+                    if [ "$day" -ge 0 ]; then
+                        nciel=$((nciel + 1))
+
+                        alt=$(echo "$line" |
+                            sed 's/.*alt="\([^"]*\)".*/\1/')
+
+                        if [ "$nciel" -le 2 ]; then
+                            ciel="$alt"
+                        fi
+                    fi
+
+                    attente=""
+                    ;;
+
+                '<div'*block-mfbulletintendance*)
+                    break
+                    ;;
+
+                '<strong'*)
+                    attente="vent"
+                    ;;
+
+                '<'*)
+                    attente=""
+                    ;;
+
+                *)
+                    [ "$day" -lt 0 ] && continue
+
+                    case "$line" in
+
+                        *°)
+                            temp=${line%°}
+
+                            if [[ "$temp" =~ ^-?[0-9]+$ ]]; then
+
+                                if [ -z "$tmin" ] ||
+                                   [ "$temp" -lt "$tmin" ]; then
+                                    tmin=$temp
+                                fi
+
+                                if [ -z "$tmax" ] ||
+                                   [ "$temp" -gt "$tmax" ]; then
+                                    tmax=$temp
+                                fi
+                            fi
+                            ;;
+
+                        *)
+                                if [ "$attente" = "vent" ]; then
+                                vent_value=$(echo "$line" |
+                                    grep -oE '[0-9]+' |
+                                    head -n 1)
+
+                                if [ -n "$vent_value" ]; then
+                                    sum=$((sum + vent_value))
+                                    n=$((n + 1))
+                                fi
+                            fi
+                            ;;
+                    esac
+
+                    attente=""
+                    ;;
+            esac
+
+        done < "$tmp"
+
+        save_day
+
+        rm -f "$tmp"
+    done
+}
+
+parse_day() {
+    local j m a
+
+    IFS=':' read -r j m a <<< "$1"
+
+    [ -z "$m" ] && m=$(date +%m)
+    [ -z "$a" ] && a=$(date +%Y)
+
+    [ "${#a}" -eq 2 ] && a="20$a"
+
+    printf '%04d-%02d-%02d' \
+        "$((10#$a))" "$((10#$m))" "$((10#$j))"
+}
+show_analyse() {
+    mkdirs
+
+    if [ ! -s "$DB" ]; then
+        echo "Aucune donnee analysee."
+        echo "Executez ./meteo -a d'abord."
+        return
+    fi
+
+    echo "===== TABLEAU DES ANALYSES METEO ====="
+
+    printf "%-12s %-12s %-8s %-12s %-22s %-6s %-6s %-8s %-10s\n" \
+        "Capture" "Ville" "Postal" "Jour" "Ciel" "Min" "Max" "Vent" "Confiance"
+
+    printf '%s\n' "----------------------------------------------------------------------------------------------------------------"
+
+    while IFS='|' read -r capture ville postal jour ciel tmin tmax vent conf; do
+        printf "%-12s %-12s %-8s %-12s %-22s %-6s %-6s %-8s %-10s\n" \
+            "$capture" "$ville" "$postal" "$jour" "$ciel" "$tmin" "$tmax" "$vent" "$conf"
+    done < "$DB"
+}
+do_web() {
+    mkdirs
+
+    local ville="$1"
+    local jour="$2"
+    local cible out
+
+    local capture v p d ciel tmin tmax vent conf
+
+    cible=$(parse_day "$jour")
+    out="$ville-$jour.html"
+
+    {
+        echo "<html>"
+        echo "<head>"
+        echo "<meta charset=\"UTF-8\">"
+        echo "<title>Meteo $ville $cible</title>"
+        echo "</head>"
+        echo "<body>"
+
+        echo "<h1>$ville</h1>"
+        echo "<h2>$cible</h2>"
+
+        echo "<table border=\"1\">"
+        echo "<tr>"
+        echo "<th>Capture</th>"
+        echo "<th>Ville</th>"
+        echo "<th>Code postal</th>"
+        echo "<th>Jour</th>"
+        echo "<th>Ciel</th>"
+        echo "<th>Min</th>"
+        echo "<th>Max</th>"
+        echo "<th>Vent (km/h)</th>"
+        echo "<th>Confiance</th>"
+        echo "</tr>"
+
+        while IFS='|' read -r capture v p d ciel tmin tmax vent conf; do
+
+            if [ "$d" = "$cible" ] &&
+               { [ "${v,,}" = "${ville,,}" ] ||
+                 [ "$p" = "$ville" ]; }; then
+
+                echo "<tr>"
+                echo "<td>$capture</td>"
+                echo "<td>$v</td>"
+                echo "<td>$p</td>"
+                echo "<td>$d</td>"
+                echo "<td>$ciel</td>"
+                echo "<td>$tmin</td>"
+                echo "<td>$tmax</td>"
+                echo "<td>$vent</td>"
+                echo "<td>$conf</td>"
+                echo "</tr>"
+            fi
+
+        done < "$DB"
+
+        echo "</table>"
+        echo "</body>"
+        echo "</html>"
+
+    } > "$out"
+
+    echo "Page creee : $out"
+}
+
+
+[ $# -eq 0 ] && {
+    usage
+    exit 0
+}
+
+mkdirs
+
+while [ $# -gt 0 ]; do
+
+    opt="${1/#–/-}"
+    shift
+
+    case "$opt" in
+
+        -i)
+            do_init
+            ;;
+
+        -c)
+            do_clean
+            ;;
+
+        -e)
+            do_erase
+            ;;
+	-m)
+    	   if [ $# -lt 1 ]; then
+             echo "Erreur : -m demande une ville." >&2
+             exit 1
+           fi
+           do_meteo "$1"
+           shift
+           ;;
+
+        -a)
+            do_analyse
+            ;;
+
+        -w)
+            if [ $# -lt 2 ]; then
+                echo "Erreur : -w demande une ville et un jour." >&2
+                exit 1
+            fi
+
+            do_web "$1" "$2"
+            shift 2
+            ;;
+        -l)
+           show_analyse
+           ;;
+        -h)
+            usage
+            ;;
+
+        *)
+            echo "meteo: option inconnue : $opt" >&2
+            exit 1
+            ;;
+
+    esac
+done
+
+exit 0
